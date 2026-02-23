@@ -604,6 +604,38 @@ def train_v082(
 
     rng = np.random.RandomState(42)
 
+    # =========================================================================
+    # PRE-GENERATE ALL DATA ON GPU (eliminates CPU bottleneck)
+    # =========================================================================
+    print("\nPre-generating training data on GPU...")
+    examples_per_dsl = 512  # pool size per DSL
+    pregen_start = time.time()
+
+    dsl_pools = {}  # dsl_index -> (before_bits, ops, after_bits) on GPU
+    for di, dsl in enumerate(train_dsls):
+        examples = generate_examples(dsl, examples_per_dsl, rng)
+        if len(examples) < support_size + batch_size:
+            # Retry with more attempts
+            examples = generate_examples(dsl, examples_per_dsl * 2, rng)
+
+        before_bits = torch.tensor(
+            np.array([state_to_bits(ex[0]) for ex in examples]),
+            dtype=torch.float32, device=device
+        )
+        ops = torch.tensor(
+            [ex[1] for ex in examples],
+            dtype=torch.long, device=device
+        )
+        after_bits = torch.tensor(
+            np.array([state_to_bits(ex[2]) for ex in examples]),
+            dtype=torch.float32, device=device
+        )
+        dsl_pools[di] = (before_bits, ops, after_bits)
+
+    pregen_time = time.time() - pregen_start
+    print(f"  Pre-generated {len(train_dsls)} DSLs x {examples_per_dsl} examples in {pregen_time:.1f}s")
+    print(f"  GPU memory: ~{torch.cuda.memory_allocated() / 1024**2:.0f} MB")
+
     print("\n" + "=" * 70)
     print("TRAINING")
     print("=" * 70)
@@ -614,6 +646,8 @@ def train_v082(
     best_epoch = 0
     history = []
 
+    n_train = len(train_dsls)
+
     for epoch in range(epochs):
         model.train()
         epoch_loss = 0.0
@@ -622,44 +656,26 @@ def train_v082(
 
         for batch_idx in range(batches_per_epoch):
             # Sample random DSL
-            dsl = train_dsls[rng.randint(0, len(train_dsls))]
+            di = rng.randint(0, n_train)
+            pool_before, pool_ops, pool_after = dsl_pools[di]
+            pool_size = pool_before.shape[0]
 
-            # Generate examples
-            examples = generate_examples(dsl, support_size + batch_size, rng)
-            if len(examples) < support_size + batch_size:
+            # Random indices for support + query from pre-generated pool
+            indices = torch.randperm(pool_size, device=device)[:support_size + batch_size]
+            if len(indices) < support_size + batch_size:
                 continue
 
-            support_examples = examples[:support_size]
-            query_examples = examples[support_size:support_size + batch_size]
+            sup_idx = indices[:support_size]
+            qry_idx = indices[support_size:support_size + batch_size]
 
-            # Convert to tensors
-            support_before = torch.tensor(
-                np.array([state_to_bits(ex[0]) for ex in support_examples]),
-                dtype=torch.float32, device=device
-            ).unsqueeze(0).expand(len(query_examples), -1, -1, -1)
+            # Index directly from GPU tensors (no CPU work!)
+            support_before = pool_before[sup_idx].unsqueeze(0).expand(len(qry_idx), -1, -1, -1)
+            support_ops = pool_ops[sup_idx].unsqueeze(0).expand(len(qry_idx), -1)
+            support_after = pool_after[sup_idx].unsqueeze(0).expand(len(qry_idx), -1, -1, -1)
 
-            support_ops = torch.tensor(
-                [[ex[1] for ex in support_examples]],
-                dtype=torch.long, device=device
-            ).expand(len(query_examples), -1)
-
-            support_after = torch.tensor(
-                np.array([state_to_bits(ex[2]) for ex in support_examples]),
-                dtype=torch.float32, device=device
-            ).unsqueeze(0).expand(len(query_examples), -1, -1, -1)
-
-            query_before = torch.tensor(
-                np.array([state_to_bits(ex[0]) for ex in query_examples]),
-                dtype=torch.float32, device=device
-            )
-            query_ops = torch.tensor(
-                [ex[1] for ex in query_examples],
-                dtype=torch.long, device=device
-            )
-            target_after = torch.tensor(
-                np.array([state_to_bits(ex[2]) for ex in query_examples]),
-                dtype=torch.float32, device=device
-            )
+            query_before = pool_before[qry_idx]
+            query_ops = pool_ops[qry_idx]
+            target_after = pool_after[qry_idx]
 
             # Forward
             support_enc = model.encode_support(support_before, support_ops, support_after)
@@ -681,7 +697,7 @@ def train_v082(
 
             epoch_loss += loss.item()
             epoch_correct += correct
-            epoch_total += len(query_examples)
+            epoch_total += len(qry_idx)
 
         acc = epoch_correct / max(epoch_total, 1)
         avg_loss = epoch_loss / batches_per_epoch
