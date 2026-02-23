@@ -29,7 +29,7 @@ def run_eval(
 
     # Load checkpoint
     print(f"\nLoading: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = checkpoint.get('config', ScaledConfig())
 
     model = BitFluxMindScaled(config)
