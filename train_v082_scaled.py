@@ -153,8 +153,8 @@ class BitFluxMindScaled(nn.Module):
         """Encode support examples."""
         batch_size, n_examples = bits_before.shape[:2]
 
-        bb_flat = bits_before.view(batch_size * n_examples, *bits_before.shape[2:])
-        ba_flat = bits_after.view(batch_size * n_examples, *bits_after.shape[2:])
+        bb_flat = bits_before.reshape(batch_size * n_examples, *bits_before.shape[2:])
+        ba_flat = bits_after.reshape(batch_size * n_examples, *bits_after.shape[2:])
 
         before_emb = self.before_encoder(bb_flat)
         after_emb = self.after_encoder(ba_flat)
